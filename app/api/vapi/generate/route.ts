@@ -293,9 +293,29 @@ export async function POST(request: Request) {
     let body: any;
     try {
         body = await request.json();
-        console.log("Request body:", body);
+        console.log("Raw request body:", JSON.stringify(body, null, 2));
     } catch (e) {
         body = {};
+    }
+
+    // ── Handle VAPI server-message envelope ──────────────────────────────────
+    // VAPI wraps tool call data inside: body.message.toolCallList[0].function.arguments
+    // or body.message.toolCalls[0].function.arguments (both formats exist depending on version)
+    let params: any = body;
+    if (body?.message?.type === "tool-calls") {
+        const toolCall =
+            body.message?.toolCallList?.[0] ||
+            body.message?.toolCalls?.[0];
+        if (toolCall?.function?.arguments) {
+            try {
+                params = typeof toolCall.function.arguments === "string"
+                    ? JSON.parse(toolCall.function.arguments)
+                    : toolCall.function.arguments;
+                console.log("Extracted VAPI tool-call params:", params);
+            } catch (e) {
+                console.warn("Could not parse tool-call arguments, using raw body");
+            }
+        }
     }
 
     const {
@@ -304,10 +324,10 @@ export async function POST(request: Request) {
         level = "Junior",
         techstack = "React, JavaScript",
         amount = 5,
-    } = body;
+    } = params;
 
-    // Get userId — Vapi sends it as "userid" (lowercase)
-    const userId = body.userid || body.userId || "vapi-user-" + Date.now();
+    // Get userId — client sends "userid" (lowercase), VAPI may send either casing
+    const userId = params.userid || params.userId || body.userid || body.userId || "vapi-user-" + Date.now();
 
     console.log("Generating interview for:", { type, role, level, techstack, amount, userId });
 

@@ -311,10 +311,65 @@ import { cn } from "@/lib/utils";
 import { vapi } from "@/lib/vapi.sdk";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { createFeedback } from "@/lib/actions/general.action";
 import { interviewer } from "@/constants";
+
+// ─── Transcript Parser ──────────────────────────────────────────────────────
+// Extracts interview parameters from the conversation transcript.
+// The AI asks about role, tech stack, experience level, type, and amount.
+function extractInterviewParams(messages: SavedMessage[]) {
+    const fullText = messages
+        .map((m) => `${m.role}: ${m.content}`)
+        .join("\n")
+        .toLowerCase();
+
+    // --- Role ---
+    const rolePatterns = [
+        /(?:applying for|role(?:\s+is)?|position(?:\s+is)?|job(?:\s+is)?)[:\s]+([a-z\s]+?)(?:\s*[,.\n]|$)/i,
+        /(?:i(?:'m| am)(?: a| an)?)[:\s]+([a-z\s]+?developer[a-z\s]*?)(?:\s*[,.\n]|$)/i,
+        /(?:i(?:'m| am)(?: a| an)?)[:\s]+([a-z\s]+?engineer[a-z\s]*?)(?:\s*[,.\n]|$)/i,
+    ];
+    let role = "Software Developer";
+    for (const pat of rolePatterns) {
+        const m = fullText.match(pat);
+        if (m?.[1]?.trim()) {
+            role = m[1].trim().replace(/\b\w/g, (c) => c.toUpperCase());
+            break;
+        }
+    }
+
+    // --- Tech Stack ---
+    const knownTechs = [
+        "react", "next.js", "nextjs", "vue", "angular", "node.js", "nodejs",
+        "express", "typescript", "javascript", "python", "java", "c#", "c++",
+        "go", "rust", "php", "ruby", "swift", "kotlin", "flutter", "dart",
+        "django", "fastapi", "spring", "mongodb", "postgresql", "mysql",
+        "firebase", "aws", "azure", "gcp", "docker", "kubernetes", "graphql",
+        "tailwind", "sass", "redux", "prisma", "supabase", "sql",
+    ];
+    const foundTechs = knownTechs.filter((tech) => fullText.includes(tech));
+    const techstack = foundTechs.length > 0 ? foundTechs.join(", ") : "JavaScript, React";
+
+    // --- Level ---
+    let level = "Junior";
+    if (/\bsenior\b/.test(fullText)) level = "Senior";
+    else if (/\bmid[-\s]?level\b|\bmiddle\b/.test(fullText)) level = "Mid-level";
+    else if (/\bjunior\b|\bentry[-\s]?level\b|\bfresher\b/.test(fullText)) level = "Junior";
+
+    // --- Type ---
+    let type = "technical";
+    if (/\bbehaviou?ral\b/.test(fullText)) type = "behavioural";
+    else if (/\bmixed\b/.test(fullText)) type = "mixed";
+    else if (/\btechnical\b/.test(fullText)) type = "technical";
+
+    // --- Amount ---
+    const amountMatch = fullText.match(/\b(\d+)\s*(?:questions?)\b/);
+    const amount = amountMatch ? parseInt(amountMatch[1], 10) : 5;
+
+    return { role, techstack, level, type, amount };
+}
 
 enum CallStatus {
     INACTIVE = "INACTIVE",
@@ -351,6 +406,9 @@ const Agent = ({
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [error, setError] = useState<string>("");
     const [lastMessage, setLastMessage] = useState<string>("");
+    const [isGenerating, setIsGenerating] = useState(false);
+    // Use a ref so the FINISHED handler always has access to the latest messages
+    const messagesRef = useRef<SavedMessage[]>([]);
 
     useEffect(() => {
         const onCallStart = () => {
@@ -371,7 +429,11 @@ const Agent = ({
                     role: message.role,
                     content: message.transcript,
                 };
-                setMessages((prev) => [...prev, newMessage]);
+                setMessages((prev) => {
+                    const updated = [...prev, newMessage];
+                    messagesRef.current = updated;
+                    return updated;
+                });
             }
         };
 
@@ -386,11 +448,13 @@ const Agent = ({
         };
 
         const onError = (error: any) => {
-            console.error("❌ Vapi Error:", error);
-            if (error?.errorMsg === "Meeting has ended" && error?.action === "error") {
-                console.log("Call ended normally.");
+            // "Meeting has ended" is VAPI's normal signal that the AI ended the call.
+            // Guard this BEFORE console.error so the Next.js dev overlay is not triggered.
+            if (error?.errorMsg === "Meeting has ended" || error?.message === "Meeting has ended") {
+                console.log("✅ Call ended normally by assistant.");
                 return;
             }
+            console.error("❌ Vapi Error:", error);
             setError(error.message || "An error occurred");
             setCallStatus(CallStatus.INACTIVE);
         };
@@ -417,13 +481,45 @@ const Agent = ({
             setLastMessage(messages[messages.length - 1].content);
         }
 
-        const handleGenerateFeedback = async (messages: SavedMessage[]) => {
+        const handleGenerateInterview = async (msgs: SavedMessage[]) => {
+            console.log("📋 Parsing transcript to generate interview...");
+            setIsGenerating(true);
+
+            const params = extractInterviewParams(msgs);
+            console.log("Extracted params:", params);
+
+            try {
+                const response = await fetch("/api/vapi/generate", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        ...params,
+                        userid: userId,
+                    }),
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    console.log("✅ Interview generated and saved to Firestore!");
+                } else {
+                    console.error("❌ Failed to generate interview:", data);
+                }
+            } catch (err) {
+                console.error("❌ Network error generating interview:", err);
+            } finally {
+                setIsGenerating(false);
+                router.push("/");
+            }
+        };
+
+        const handleGenerateFeedback = async (msgs: SavedMessage[]) => {
             console.log("Generating feedback...");
 
             const { success, feedbackId: id } = await createFeedback({
                 interviewId: interviewId!,
                 userId: userId!,
-                transcript: messages,
+                transcript: msgs,
                 feedbackId,
             });
 
@@ -437,14 +533,14 @@ const Agent = ({
 
         if (callStatus === CallStatus.FINISHED) {
             if (type === "generate") {
-                router.push("/");
+                // Use ref to ensure we have the latest messages even if state batching delays
+                handleGenerateInterview(messagesRef.current.length > 0 ? messagesRef.current : messages);
             } else {
                 handleGenerateFeedback(messages);
             }
         }
     }, [messages, callStatus, feedbackId, interviewId, router, type, userId]);
 
-    // ✅ ONLY THIS FUNCTION CHANGED
     const handleCall = async () => {
         console.log("Starting call...");
         setCallStatus(CallStatus.CONNECTING);
@@ -503,6 +599,27 @@ const Agent = ({
     const latestMessage = messages[messages.length - 1]?.content;
     const isCallInactiveFinished =
         callStatus === CallStatus.INACTIVE || callStatus === CallStatus.FINISHED;
+
+    // Show a full-screen loading overlay while generating the interview card
+    if (isGenerating) {
+        return (
+            <div className="flex flex-col items-center justify-center gap-6 py-16">
+                <div className="relative flex items-center justify-center">
+                    <span className="absolute inline-flex h-24 w-24 rounded-full bg-primary-200 opacity-30 animate-ping" />
+                    <span className="relative inline-flex h-16 w-16 rounded-full bg-primary-200 items-center justify-center">
+                        <svg className="animate-spin h-8 w-8 text-primary-100" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                        </svg>
+                    </span>
+                </div>
+                <div className="text-center">
+                    <h3 className="text-xl font-semibold">Generating Your Interview...</h3>
+                    <p className="text-sm text-gray-400 mt-2">We&apos;re preparing your personalized questions. This will take a moment.</p>
+                </div>
+            </div>
+        );
+    }
 
     return (
         <>
